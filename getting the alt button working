@@ -1,0 +1,64 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+
+#define TFT_CS   10
+#define TFT_DC   48
+#define TFT_MOSI 35
+#define TFT_SCK  36
+#define BTN_ALT  1
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCK, -1);
+
+int currentScreen = 0;
+bool lastButtonState = HIGH;
+
+void drawHomeScreen() {
+  tft.fillRect(0, 0, 128, 128, ILI9341_BLACK);
+  tft.drawRect(0, 0, 128, 128, ILI9341_WHITE);
+
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(3);
+  tft.setCursor(19, 25);
+  tft.println("07:40");
+
+  tft.setTextSize(1);
+  tft.setCursor(28, 55);
+  tft.println("25 SEP 2026");
+
+  tft.setCursor(71, 4);
+  tft.println("BATT: 87%");
+}
+
+void drawStopwatchScreen() {
+  tft.fillRect(0, 0, 128, 128, ILI9341_BLACK);
+  tft.drawRect(0, 0, 128, 128, ILI9341_WHITE);
+
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(20, 55);
+  tft.println("STOPWATCH");
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BTN_ALT, INPUT_PULLUP);
+  tft.begin();
+  delay(100);
+  drawHomeScreen();
+}
+
+void loop() {
+  bool buttonState = digitalRead(BTN_ALT);
+
+  if (buttonState == LOW && lastButtonState == HIGH) {
+    currentScreen = 1 - currentScreen;
+
+    if (currentScreen == 0) {
+      drawHomeScreen();
+    } else {
+      drawStopwatchScreen();
+    }
+  }
+
+  lastButtonState = buttonState;
+}
