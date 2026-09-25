@@ -1,0 +1,48 @@
+from Artemis import *
+import time
+
+begin()
+
+TotalElapsed = None
+elapsed = None
+running = None
+StartTime = None
+
+
+def cb_f29qXsw1GteIfcXNe():
+	global TotalElapsed, elapsed, running, StartTime
+
+	if running == True:
+	  running = False
+	else:
+	  StartTime = time.ticks_ms()
+	  running = True
+	  TotalElapsed = 0
+
+buttons.on_press(Buttons.Up, cb_f29qXsw1GteIfcXNe)
+
+def cb_qyDAL6tDkiZrH():
+	global TotalElapsed, elapsed, running, StartTime
+
+	if running == True:
+	  TotalElapsed = TotalElapsed + elapsed
+	  elapsed = 0
+	  running = False
+	else:
+	  StartTime = time.ticks_ms()
+	  running = True
+
+buttons.on_press(Buttons.Down, cb_qyDAL6tDkiZrH)
+
+TotalElapsed = 0
+
+elapsed = 0
+
+while True:
+	buttons.scan()
+	display.fill(0)
+	if running == True:
+	  elapsed = time.ticks_ms() - StartTime
+	display.text(str('time' + str(TotalElapsed + elapsed)), int(10), int(10), Display.Color.Cyan)
+	display.commit()
+	time.sleep_ms(50)
