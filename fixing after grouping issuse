@@ -1,0 +1,31 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+
+#define TFT_CS   10
+#define TFT_DC   48
+#define TFT_MOSI 35
+#define TFT_SCK  36
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCK, -1);
+
+void setup() {
+  Serial.begin(115200);
+  tft.begin();
+  tft.drawRect(0, 0, 128, 128, ILI9341_WHITE);
+
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(3);
+
+  tft.setCursor(18, 25);
+  tft.println("07:40");
+
+  tft.setTextSize(1);
+  tft.setCursor(35, 55);
+  tft.println("25 SEP 2026");
+
+  tft.setCursor(55, 4);
+  tft.println("BATT: 87%");
+}
+
+void loop() {
+}
