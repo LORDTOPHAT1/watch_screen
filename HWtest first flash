@@ -1,0 +1,108 @@
+#include <LovyanGFX.hpp>
+#include <Wire.h>
+#include "esp_efuse.h"
+
+#define PIN_SCK    36
+#define PIN_MOSI   35
+#define PIN_DC     48
+#define PIN_RST    34
+#define PIN_BL     33
+#define PIN_BATT   5
+#define BTN_UP     1
+#define BTN_DOWN   2
+#define BTN_SELECT 3
+#define BTN_ALT    21
+
+#define C_WHITE 0xFFFFFFU
+#define C_BLACK 0x000000U
+
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Panel_ST7735S _panel;
+  lgfx::Bus_SPI _bus;
+public:
+  void configure(bool rev3) {
+    {
+      auto cfg = _bus.config();
+      cfg.spi_host = SPI2_HOST;
+      cfg.spi_mode = 0;
+      cfg.freq_write = 40000000;
+      cfg.pin_sclk = PIN_SCK;
+      cfg.pin_mosi = PIN_MOSI;
+      cfg.pin_miso = -1;
+      cfg.pin_dc = PIN_DC;
+      _bus.config(cfg);
+      _panel.setBus(&_bus);
+    }
+    {
+      auto cfg = _panel.config();
+      cfg.pin_cs = -1;
+      cfg.pin_rst = PIN_RST;
+      cfg.panel_width = 128;
+      cfg.panel_height = 128;
+      cfg.memory_width = rev3 ? 128 : 132;
+      cfg.memory_height = rev3 ? 160 : 132;
+      cfg.offset_x = rev3 ? 0 : 2;
+      cfg.offset_y = rev3 ? 0 : 1;
+      cfg.offset_rotation = 1;
+      cfg.readable = false;
+      cfg.invert = false;
+      cfg.rgb_order = false;
+      _panel.config(cfg);
+    }
+    setPanel(&_panel);
+  }
+};
+
+LGFX lcd;
+
+uint8_t bcd(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
+
+bool readRTC(uint8_t &h, uint8_t &m, uint8_t &s) {
+  Wire.beginTransmission(0x51);
+  Wire.write(0x02);
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom(0x51, 3) != 3) return false;
+  s = bcd(Wire.read() & 0x7F);
+  m = bcd(Wire.read() & 0x7F);
+  h = bcd(Wire.read() & 0x3F);
+  return true;
+}
+
+void setup() {
+  pinMode(PIN_BL, OUTPUT);
+  digitalWrite(PIN_BL, LOW);   // LOW should be backlight on; flip to HIGH if the screen is dark
+
+  pinMode(BTN_UP, INPUT_PULLDOWN);
+  pinMode(BTN_DOWN, INPUT_PULLDOWN);
+  pinMode(BTN_SELECT, INPUT_PULLDOWN);
+  pinMode(BTN_ALT, INPUT_PULLDOWN);
+
+  Wire.begin(40, 41);
+
+  uint8_t rev = esp_efuse_read_reg(EFUSE_BLK3, 1) & 0xFF;
+  lcd.configure(rev >= 3);
+  lcd.init();
+  lcd.fillScreen(C_BLACK);
+  lcd.drawRect(0, 0, 128, 128, C_WHITE);
+  lcd.setTextColor(C_WHITE, C_BLACK);
+  lcd.setTextSize(1);
+  lcd.setCursor(6, 6);
+  lcd.printf("REV %u", rev);
+}
+
+void loop() {
+  lcd.setCursor(6, 24);
+  lcd.printf("UP:%d DN:%d  ", digitalRead(BTN_UP), digitalRead(BTN_DOWN));
+  lcd.setCursor(6, 36);
+  lcd.printf("SEL:%d ALT:%d  ", digitalRead(BTN_SELECT), digitalRead(BTN_ALT));
+
+  uint8_t h, m, s;
+  lcd.setCursor(6, 54);
+  if (readRTC(h, m, s)) lcd.printf("RTC %02u:%02u:%02u", h, m, s);
+  else lcd.print("RTC FAIL     ");
+
+  lcd.setCursor(6, 72);
+  lcd.printf("BATT %4u mV  ", analogReadMilliVolts(PIN_BATT));
+
+  delay(100);
+}
