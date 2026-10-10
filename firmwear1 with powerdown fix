@@ -1,0 +1,773 @@
+#include <LovyanGFX.hpp>
+#include <Wire.h>
+#include "esp_efuse.h"
+#include "esp_sleep.h"
+#include "driver/gpio.h"
+
+#define PIN_SCK    36
+#define PIN_MOSI   35
+#define PIN_DC     48
+#define PIN_RST    34
+#define PIN_BL     33
+#define PIN_BATT   5
+#define PIN_VREF   4
+#define PIN_USB    42
+#define PIN_CHRG   7
+#define PIN_PWDN   37
+#define PIN_SDA    40
+#define PIN_SCL    41
+#define BTN_UP     1
+#define BTN_DOWN   2
+#define BTN_SELECT 3
+#define BTN_ALT    21
+
+#define BACKLIGHT_LEVEL   140     // 0 to 255
+#define SCREEN_TIMEOUT_MS 20000   // 0 means never turn the screen off
+#define LOW_BATT_PCT      3       // cutoff level, set to 99 only for the cutoff test
+#define LOW_BATT_HOLD_MS  10000
+#define POWER_HOLD_MS     5000    // hold ALT this long to open the power off prompt
+#define POWER_PROMPT_MS   10000   // prompt cancels itself after this long
+
+#define C_BLACK  0x000000U
+#define C_WHITE  0xFFFFFFU
+#define C_YELLOW 0xFFFF00U
+#define C_GREEN  0x00FF00U
+#define C_GREY   0xC8C8C8U
+
+const uint8_t LED_PINS[] = {17, 18, 43, 44, 45, 46};
+
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Panel_ST7735S _panel;
+  lgfx::Bus_SPI _bus;
+public:
+  void configure(bool rev3) {
+    {
+      auto cfg = _bus.config();
+      cfg.spi_host = SPI2_HOST;
+      cfg.spi_mode = 0;
+      cfg.freq_write = 40000000;
+      cfg.pin_sclk = PIN_SCK;
+      cfg.pin_mosi = PIN_MOSI;
+      cfg.pin_miso = -1;
+      cfg.pin_dc = PIN_DC;
+      _bus.config(cfg);
+      _panel.setBus(&_bus);
+    }
+    {
+      auto cfg = _panel.config();
+      cfg.pin_cs = -1;
+      cfg.pin_rst = PIN_RST;
+      cfg.panel_width = 128;
+      cfg.panel_height = 128;
+      cfg.memory_width = rev3 ? 128 : 132;
+      cfg.memory_height = rev3 ? 160 : 132;
+      cfg.offset_x = rev3 ? 0 : 2;
+      cfg.offset_y = rev3 ? 0 : 1;
+      cfg.offset_rotation = 1;
+      cfg.readable = false;
+      cfg.invert = false;
+      cfg.rgb_order = false;
+      _panel.config(cfg);
+    }
+    setPanel(&_panel);
+  }
+};
+
+struct Button {
+  uint8_t pin;
+  bool held = false;
+  bool pressed = false;    // true for one loop when pressed
+  bool released = false;   // true for one loop when let go
+  bool repeat = false;     // true on press, then again while held
+  unsigned long since = 0, lastRepeat = 0;
+  Button(uint8_t p) : pin(p) {}
+  unsigned long heldMs() const { return held ? millis() - since : 0; }
+  void update() {
+    bool now = digitalRead(pin) == HIGH;   // watch buttons read HIGH when pressed
+    unsigned long t = millis();
+    pressed = now && !held;
+    released = !now && held;
+    repeat = pressed;
+    if (pressed) {
+      since = t;
+      lastRepeat = t;
+    } else if (now && t - since > 500 && t - lastRepeat > 120) {
+      repeat = true;
+      lastRepeat = t;
+    }
+    held = now;
+  }
+};
+
+struct RtcTime {
+  uint8_t h = 0, m = 0, s = 0, d = 1, mo = 1;
+  uint16_t y = 2026;
+};
+
+enum ChargeState { CS_UNPLUGGED, CS_CHARGING, CS_FULL };
+
+LGFX lcd;
+lgfx::LGFX_Sprite spr(&lcd);
+
+Button btnUp(BTN_UP), btnDown(BTN_DOWN), btnSel(BTN_SELECT), btnAlt(BTN_ALT);
+
+enum { SCR_HOME, SCR_STOPWATCH, SCR_SETTIME, SCR_POWEROFF };
+int screen = SCR_HOME;
+bool dirty = true;
+bool screenOff = false;
+bool diag = false;
+uint8_t hwRev = 0;
+unsigned long lastActivity = 0, lastRtc = 0, lastBatt = 0, lastTenths = 0;
+
+bool altHoldFired = false, altIgnoreRelease = false;
+int screenBeforePower = SCR_HOME;
+bool powerYes = false;
+unsigned long powerPromptSince = 0;
+
+RtcTime cur;
+bool rtcOk = false;
+
+ChargeState chargeState = CS_UNPLUGGED, chargeCand = CS_UNPLUGGED;
+unsigned long chargeCandSince = 0;
+
+float battMv = -1;
+int battPct = 0;
+float calReading = 0;
+float calOffsetMv = 0;
+bool calOk = false;
+unsigned long lowSince = 0;
+
+bool swRunning = false;
+unsigned long swStart = 0, swBanked = 0;
+
+int setField = 0;
+int eh = 0, em = 0, ed = 1, emo = 1, ey = 2026;
+
+const char* MONTHS[] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                        "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
+
+uint8_t fromBcd(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
+uint8_t toBcd(uint8_t v) { return ((v / 10) << 4) | (v % 10); }
+
+int dayOfWeek(int y, int m, int d) {   // 0 = Sunday
+  static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+  if (m < 3) y -= 1;
+  return (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
+}
+
+int daysInMonth(int y, int m) {
+  static const uint8_t dm[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
+  return dm[m - 1];
+}
+
+void ledsOff() {   // stock's bootloader does this, our build skips the bootloader hook
+  for (uint8_t p : LED_PINS) {
+    pinMode(p, OUTPUT);
+    digitalWrite(p, LOW);
+  }
+}
+
+bool rtcRead(RtcTime &c) {
+  Wire.beginTransmission(0x51);
+  Wire.write(0x02);
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom(0x51, 7) != 7) return false;
+  c.s = fromBcd(Wire.read() & 0x7F);
+  c.m = fromBcd(Wire.read() & 0x7F);
+  c.h = fromBcd(Wire.read() & 0x3F);
+  c.d = fromBcd(Wire.read() & 0x3F);
+  Wire.read();                              // weekday, not used
+  c.mo = fromBcd(Wire.read() & 0x1F);
+  c.y = 2000 + fromBcd(Wire.read());
+  return true;
+}
+
+void rtcWrite(const RtcTime &t) {
+  Wire.beginTransmission(0x51);
+  Wire.write(0x02);
+  Wire.write(toBcd(t.s));
+  Wire.write(toBcd(t.m));
+  Wire.write(toBcd(t.h));
+  Wire.write(toBcd(t.d));
+  Wire.write((uint8_t)dayOfWeek(t.y, t.mo, t.d));
+  Wire.write((uint8_t)(toBcd(t.mo) | 0x80));   // century bit, set the same way stock does
+  Wire.write(toBcd(t.y % 100));
+  Wire.endTransmission();
+}
+
+bool usbPlugged() { return digitalRead(PIN_USB) == HIGH; }
+
+float readPinMv() {
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; i++) sum += analogReadMilliVolts(PIN_BATT);
+  return sum / 8.0f;
+}
+
+void calibrateBattery() {
+  pinMode(PIN_VREF, OUTPUT);
+  digitalWrite(PIN_VREF, HIGH);             // switches the 2.5 V reference onto the sense line
+  delay(100);
+  for (int i = 0; i < 10; i++) {
+    analogReadMilliVolts(PIN_BATT);
+    delay(10);
+  }
+  uint32_t sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += analogReadMilliVolts(PIN_BATT);
+    delay(10);
+  }
+  digitalWrite(PIN_VREF, LOW);
+  delay(100);
+
+  calReading = (sum / 10.0f) * 4.0f;
+  if (calReading > 2300.0f && calReading < 2700.0f) {
+    calOffsetMv = 2500.0f - calReading;
+    calOk = true;
+  } else {
+    calOffsetMv = 0;
+    calOk = false;
+  }
+}
+
+void sampleBattery() {
+  if (chargeState != CS_UNPLUGGED) return;   // stock also skips the percentage while plugged in
+  float mv = readPinMv() * 4.0f + 75.0f + calOffsetMv;
+  battMv = (battMv < 0) ? mv : battMv * 0.8f + mv * 0.2f;
+  battPct = constrain((int)((battMv - 3600.0f) * 100.0f / 550.0f + 0.5f), 0, 100);
+}
+
+ChargeState wantedCharge() {
+  if (!usbPlugged()) return CS_UNPLUGGED;
+  if (chargeState == CS_FULL) return CS_FULL;   // stays full until unplugged
+  return digitalRead(PIN_CHRG) == LOW ? CS_CHARGING : CS_FULL;
+}
+
+void updateCharging(bool fresh) {
+  ChargeState want = wantedCharge();
+  unsigned long now = millis();
+  if (fresh) {
+    chargeState = chargeCand = want;
+    return;
+  }
+  if (want != chargeCand) {
+    chargeCand = want;
+    chargeCandSince = now;
+  }
+  if (chargeCand != chargeState && now - chargeCandSince >= 500) {
+    chargeState = chargeCand;
+    battMv = -1;
+    lowSince = 0;
+    sampleBattery();
+    dirty = true;
+  }
+}
+
+void setBacklight(uint8_t level) {
+  ledcWrite(PIN_BL, 255 - level);   // active low
+}
+
+unsigned long swTotal() { return swBanked + (swRunning ? millis() - swStart : 0); }
+void swStop() {
+  if (swRunning) {
+    swBanked += millis() - swStart;
+    swRunning = false;
+  }
+}
+void swStartNow() {
+  swStart = millis();
+  swRunning = true;
+}
+
+void enterSetTime() {
+  eh = cur.h;
+  em = cur.m;
+  ed = cur.d;
+  emo = cur.mo;
+  ey = cur.y;
+  setField = 0;
+}
+
+void adjustField(int dir) {
+  switch (setField) {
+    case 0: eh = (eh + dir + 24) % 24; break;
+    case 1: em = (em + dir + 60) % 60; break;
+    case 2:
+      ed += dir;
+      if (ed > 31) ed = 1;
+      if (ed < 1) ed = 31;
+      break;
+    case 3:
+      emo += dir;
+      if (emo > 12) emo = 1;
+      if (emo < 1) emo = 12;
+      break;
+    case 4:
+      ey += dir;
+      if (ey > 2099) ey = 2099;
+      if (ey < 2024) ey = 2024;
+      break;
+  }
+}
+
+void nextField() {
+  setField++;
+  if (setField > 4) {
+    int dim = daysInMonth(ey, emo);
+    if (ed > dim) ed = dim;
+    RtcTime t;
+    t.h = eh;
+    t.m = em;
+    t.s = 0;
+    t.d = ed;
+    t.mo = emo;
+    t.y = ey;
+    rtcWrite(t);
+    cur = t;
+    screen = SCR_HOME;
+  }
+}
+
+void centered(const char* s, int y) {
+  spr.setCursor((128 - spr.textWidth(s)) / 2, y);
+  spr.print(s);
+}
+
+void drawHome() {
+  char buf[24];
+  spr.setTextColor(C_WHITE);
+
+  snprintf(buf, sizeof(buf), "%02d:%02d", cur.h, cur.m);
+  spr.setTextSize(3);
+  centered(buf, 25);
+
+  const char* mon = (cur.mo >= 1 && cur.mo <= 12) ? MONTHS[cur.mo - 1] : "???";
+  snprintf(buf, sizeof(buf), "%02d %s %04d", cur.d, mon, cur.y);
+  spr.setTextSize(1);
+  centered(buf, 55);
+
+  if (chargeState == CS_CHARGING) snprintf(buf, sizeof(buf), "CHARGING");
+  else if (chargeState == CS_FULL) snprintf(buf, sizeof(buf), "FULL");
+  else snprintf(buf, sizeof(buf), "BATT: %d%%", battPct);
+  spr.setCursor(124 - spr.textWidth(buf), 4);
+  spr.print(buf);
+
+  if (!rtcOk) {
+    spr.setTextColor(C_GREY);
+    centered("RTC ERROR", 80);
+  }
+}
+
+void drawDiag() {
+  float pin = readPinMv();
+  float live = pin * 4.0f + 75.0f + calOffsetMv;
+  const char* st = chargeState == CS_UNPLUGGED ? "BATT" : (chargeState == CS_CHARGING ? "CHG" : "FULL");
+
+  spr.setTextSize(1);
+  spr.setTextColor(C_YELLOW);
+  spr.setCursor(6, 6);
+  spr.print("DIAGNOSTICS");
+
+  spr.setTextColor(C_WHITE);
+  spr.setCursor(6, 20);
+  spr.printf("REV:%u", hwRev);
+  spr.setCursor(6, 31);
+  spr.printf("USB:%d CHRG:%d", digitalRead(PIN_USB), digitalRead(PIN_CHRG));
+  spr.setCursor(6, 42);
+  spr.printf("STATE:%s", st);
+  spr.setCursor(6, 53);
+  spr.printf("PIN:%4.0f mV", pin);
+  spr.setCursor(6, 64);
+  spr.printf("LIVE:%4.0f mV", live);
+  spr.setCursor(6, 75);
+  spr.printf("PCT:%d", battPct);
+  spr.setCursor(6, 86);
+  spr.printf("REF:%4.0f %s", calReading, calOk ? "OK" : "FAIL");
+  spr.setCursor(6, 97);
+  spr.printf("OFFSET:%+.0f mV", calOffsetMv);
+
+  spr.setTextColor(C_GREY);
+  spr.setCursor(6, 112);
+  spr.print("SEL = BACK");
+}
+
+void drawStopwatch() {
+  char buf[16];
+  unsigned long t = swTotal();
+  unsigned long tenths = (t / 100) % 10;
+  unsigned long secs = (t / 1000) % 60;
+  unsigned long mins = (t / 60000) % 60;
+  unsigned long hrs = t / 3600000UL;
+  if (hrs > 0) snprintf(buf, sizeof(buf), "%lu:%02lu:%02lu", hrs, mins, secs);
+  else snprintf(buf, sizeof(buf), "%02lu:%02lu.%lu", mins, secs, tenths);
+
+  spr.setTextColor(C_WHITE);
+  spr.setTextSize(1);
+  centered("STOPWATCH", 12);
+
+  spr.setTextSize(2);
+  centered(buf, 45);
+
+  spr.setTextSize(1);
+  if (swRunning) {
+    spr.setTextColor(C_GREEN);
+    centered("RUNNING", 75);
+  } else {
+    spr.setTextColor(C_YELLOW);
+    centered(swBanked > 0 ? "PAUSED" : "READY", 75);
+  }
+
+  spr.setTextColor(C_GREY);
+  centered("UP START/STOP", 100);
+  centered("DN PAUSE  SEL RESET", 111);
+}
+
+void drawSetTime() {
+  spr.setTextSize(1);
+  spr.setTextColor(C_WHITE);
+  centered("SET TIME", 8);
+
+  spr.setTextSize(3);
+  spr.setCursor(19, 26);
+  spr.setTextColor(setField == 0 ? C_YELLOW : C_WHITE);
+  spr.printf("%02d", eh);
+  spr.setTextColor(C_WHITE);
+  spr.print(":");
+  spr.setTextColor(setField == 1 ? C_YELLOW : C_WHITE);
+  spr.printf("%02d", em);
+
+  spr.setTextSize(2);
+  spr.setCursor(28, 64);
+  spr.setTextColor(setField == 2 ? C_YELLOW : C_WHITE);
+  spr.printf("%02d", ed);
+  spr.setTextColor(setField == 3 ? C_YELLOW : C_WHITE);
+  spr.printf(" %s", MONTHS[emo - 1]);
+
+  spr.setCursor(40, 86);
+  spr.setTextColor(setField == 4 ? C_YELLOW : C_WHITE);
+  spr.printf("%04d", ey);
+
+  spr.setTextSize(1);
+  spr.setTextColor(C_GREY);
+  centered("SEL=NEXT  UP/DN=SET", 112);
+}
+
+void drawPowerOff() {
+  spr.setTextColor(C_WHITE);
+  spr.setTextSize(2);
+  centered("POWER", 10);
+  centered("OFF?", 28);
+
+  spr.setTextSize(1);
+  spr.setTextColor(C_GREY);
+  centered("UP/DN + SEL", 52);
+
+  spr.setTextSize(2);
+  const char* labels[2] = {"NO", "YES"};
+  for (int i = 0; i < 2; i++) {
+    bool sel = (i == 0) ? !powerYes : powerYes;
+    int y = 66 + i * 26;
+    if (sel) spr.drawRect(30, y, 68, 22, C_YELLOW);
+    spr.setTextColor(sel ? C_YELLOW : C_WHITE);
+    centered(labels[i], y + 4);
+  }
+}
+
+void draw() {
+  spr.fillSprite(C_BLACK);
+  spr.drawRect(0, 0, 128, 128, C_WHITE);
+  if (screen == SCR_HOME) {
+    if (diag) drawDiag();
+    else drawHome();
+  } else if (screen == SCR_STOPWATCH) {
+    drawStopwatch();
+  } else if (screen == SCR_SETTIME) {
+    drawSetTime();
+  } else {
+    drawPowerOff();
+  }
+  spr.pushSprite(0, 0);
+}
+
+void drawNotice(const char* a, const char* b) {
+  spr.fillSprite(C_BLACK);
+  spr.drawRect(0, 0, 128, 128, C_WHITE);
+  spr.setTextColor(C_WHITE);
+  spr.setTextSize(2);
+  centered(a, 42);
+  centered(b, 64);
+  spr.pushSprite(0, 0);
+}
+
+void lowBatterySleep() {
+  swStop();
+
+  setBacklight(BACKLIGHT_LEVEL);
+  spr.fillSprite(C_BLACK);
+  spr.drawRect(0, 0, 128, 128, C_WHITE);
+  spr.setTextColor(C_WHITE);
+  spr.setTextSize(2);
+  centered("LOW", 36);
+  centered("BATTERY", 58);
+  spr.setTextSize(1);
+  spr.setTextColor(C_GREY);
+  centered("PLUG IN TO CHARGE", 94);
+  spr.pushSprite(0, 0);
+  delay(3000);
+
+  lcd.sleep();
+  ledcDetach(PIN_BL);
+  pinMode(PIN_BL, OUTPUT);
+  digitalWrite(PIN_BL, HIGH);               // active low, so HIGH means backlight off
+
+  gpio_wakeup_enable((gpio_num_t)PIN_USB, GPIO_INTR_HIGH_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  while (!usbPlugged()) {
+    esp_light_sleep_start();
+  }
+  gpio_wakeup_disable((gpio_num_t)PIN_USB);
+
+  ledcAttach(PIN_BL, 20000, 8);
+  setBacklight(0);
+  lcd.wakeup();
+  delay(150);
+
+  updateCharging(true);
+  battMv = -1;
+  lowSince = 0;
+  screenOff = false;
+  lastActivity = millis();
+  draw();
+  setBacklight(BACKLIGHT_LEVEL);
+}
+
+void powerOff() {
+  if (usbPlugged()) {                       // USB keeps the board powered, so a hard off cannot work
+    drawNotice("UNPLUG", "USB FIRST");
+    delay(2000);
+    screen = screenBeforePower;
+    dirty = true;
+    return;
+  }
+
+  swStop();
+  drawNotice("POWERING", "OFF");
+  delay(1200);
+  setBacklight(0);
+  lcd.sleep();
+
+  // Same sequence as stock's shutdown: level low first, then switch the pin to output.
+  gpio_set_level((gpio_num_t)PIN_PWDN, 0);
+  gpio_config_t cfg = {};
+  cfg.pin_bit_mask = 1ULL << PIN_PWDN;
+  cfg.mode = GPIO_MODE_OUTPUT;
+  gpio_config(&cfg);
+
+  delay(2000);                              // if power cut, the code never gets past here
+
+  // Still running, so the cut did not take effect. Put the pin back the way stock's
+  // bootloader leaves it, then wait in light sleep for ALT and restart cleanly.
+  gpio_set_direction((gpio_num_t)PIN_PWDN, GPIO_MODE_INPUT);
+  gpio_set_pull_mode((gpio_num_t)PIN_PWDN, GPIO_FLOATING);
+  ledcDetach(PIN_BL);
+  pinMode(PIN_BL, OUTPUT);
+  digitalWrite(PIN_BL, HIGH);
+  while (digitalRead(BTN_ALT) == HIGH) delay(10);
+  gpio_wakeup_enable((gpio_num_t)BTN_ALT, GPIO_INTR_HIGH_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  esp_light_sleep_start();
+  ESP.restart();
+}
+
+void checkLowBattery() {
+  if (chargeState != CS_UNPLUGGED || battMv < 0 || battPct > LOW_BATT_PCT) {
+    lowSince = 0;
+    return;
+  }
+  unsigned long now = millis();
+  if (lowSince == 0) lowSince = now;
+  else if (now - lowSince >= LOW_BATT_HOLD_MS) lowBatterySleep();
+}
+
+void handleAlt() {
+  if (btnAlt.held && !altHoldFired && screen != SCR_POWEROFF && btnAlt.heldMs() >= POWER_HOLD_MS) {
+    altHoldFired = true;
+    screenBeforePower = screen;
+    screen = SCR_POWEROFF;
+    powerYes = false;                       // NO is selected by default
+    powerPromptSince = millis();
+    dirty = true;
+  }
+
+  if (btnAlt.released) {
+    if (!altHoldFired && !altIgnoreRelease) {
+      if (screen == SCR_POWEROFF) {
+        screen = screenBeforePower;         // short ALT press cancels the prompt
+      } else {
+        diag = false;
+        screen = (screen + 1) % 3;
+        if (screen == SCR_SETTIME) enterSetTime();
+      }
+      dirty = true;
+    }
+    altHoldFired = false;
+    altIgnoreRelease = false;
+  }
+}
+
+void handleButtons() {
+  if (screen == SCR_HOME) {
+    if (btnSel.pressed) {
+      diag = !diag;
+      dirty = true;
+    }
+  } else if (screen == SCR_STOPWATCH) {
+    if (btnUp.pressed) {
+      if (swRunning) {
+        swStop();
+      } else {
+        swBanked = 0;
+        swStartNow();
+      }
+    }
+    if (btnDown.pressed) {
+      if (swRunning) swStop();
+      else swStartNow();
+    }
+    if (btnSel.pressed) {
+      swRunning = false;
+      swBanked = 0;
+    }
+    if (btnUp.pressed || btnDown.pressed || btnSel.pressed) dirty = true;
+  } else if (screen == SCR_SETTIME) {
+    if (btnUp.repeat) adjustField(+1);
+    if (btnDown.repeat) adjustField(-1);
+    if (btnSel.pressed) nextField();
+    if (btnUp.repeat || btnDown.repeat || btnSel.pressed) dirty = true;
+  } else if (screen == SCR_POWEROFF) {
+    if (btnUp.pressed || btnDown.pressed) {
+      powerYes = !powerYes;
+      powerPromptSince = millis();
+      dirty = true;
+    }
+    if (btnSel.pressed) {
+      if (powerYes) {
+        powerOff();
+      } else {
+        screen = screenBeforePower;
+        dirty = true;
+      }
+    }
+  }
+}
+
+void setup() {
+  ledsOff();
+
+  pinMode(BTN_UP, INPUT_PULLDOWN);
+  pinMode(BTN_DOWN, INPUT_PULLDOWN);
+  pinMode(BTN_SELECT, INPUT_PULLDOWN);
+  pinMode(BTN_ALT, INPUT_PULLDOWN);
+  pinMode(PIN_USB, INPUT);
+  pinMode(PIN_CHRG, INPUT);
+
+  ledcAttach(PIN_BL, 20000, 8);
+  setBacklight(0);                          // stay dark until the first frame is ready
+
+  analogSetPinAttenuation(PIN_BATT, ADC_2_5db);
+  Wire.begin(PIN_SDA, PIN_SCL);
+
+  hwRev = esp_efuse_read_reg(EFUSE_BLK3, 1) & 0xFF;
+  lcd.configure(hwRev >= 3);
+  lcd.init();
+  lcd.fillScreen(C_BLACK);
+
+  spr.setColorDepth(16);
+  spr.createSprite(128, 128);
+
+  RtcTime t;
+  if (rtcRead(t)) {
+    cur = t;
+    rtcOk = true;
+  }
+
+  updateCharging(true);
+  calibrateBattery();
+  sampleBattery();
+
+  lastActivity = millis();
+  draw();
+  dirty = false;
+  setBacklight(BACKLIGHT_LEVEL);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  btnUp.update();
+  btnDown.update();
+  btnSel.update();
+  btnAlt.update();
+  bool any = btnUp.pressed || btnDown.pressed || btnSel.pressed || btnAlt.pressed;
+
+  bool swallow = false;
+  if (any) {
+    lastActivity = now;
+    if (screenOff) {
+      setBacklight(BACKLIGHT_LEVEL);
+      screenOff = false;
+      dirty = true;
+      swallow = true;                       // the waking press does nothing else
+    }
+  }
+  if (swallow && btnAlt.pressed) altIgnoreRelease = true;
+  handleAlt();
+  if (!swallow) handleButtons();
+
+  updateCharging(false);
+
+  if (screen == SCR_POWEROFF && now - powerPromptSince > POWER_PROMPT_MS) {
+    screen = screenBeforePower;
+    dirty = true;
+  }
+
+  if (now - lastRtc >= 250) {
+    lastRtc = now;
+    RtcTime t;
+    rtcOk = rtcRead(t);
+    if (rtcOk) {
+      bool changed = (t.s != cur.s);
+      cur = t;
+      if (changed && screen == SCR_HOME) dirty = true;
+    }
+  }
+
+  if (now - lastBatt >= 2000) {
+    lastBatt = now;
+    sampleBattery();
+    checkLowBattery();                      // can sleep for a long time, so refresh the clock after it
+    if (screen == SCR_HOME) dirty = true;
+    now = millis();
+  }
+
+  if (screen == SCR_STOPWATCH && swRunning) {
+    unsigned long tenths = swTotal() / 100;
+    if (tenths != lastTenths) {
+      lastTenths = tenths;
+      dirty = true;
+    }
+  }
+
+  bool keepOn = (screen == SCR_STOPWATCH && swRunning) || screen == SCR_SETTIME || screen == SCR_POWEROFF;
+  if (SCREEN_TIMEOUT_MS > 0 && !screenOff && !keepOn && now - lastActivity > SCREEN_TIMEOUT_MS) {
+    setBacklight(0);
+    screenOff = true;
+  }
+
+  if (dirty && !screenOff) {
+    draw();
+    dirty = false;
+  }
+
+  delay(20);
+}
